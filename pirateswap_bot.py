@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PirateSwap closed Telegram bot (мониторинг + рассылка разделены).
+
+Архитектура (3 потока + общий замок):
+  1. HTTP-сервер (главный поток) — /health -> 200 для UptimeRobot, чтобы Render
+     Free не засыпал. / -> краткий статус.
+  2. Поток-поллер сайта — крутится ВСЕГДА, независимо от пользователей. При дропе
+     рассылает алерт всем из белого списка, у кого notify=true.
+  3. Поток Telegram getUpdates (long-polling) — /start, /status, inline-кнопки.
+     Переключает флаг notify ТОЛЬКО нажавшего, на мониторинг не влияет.
+
+Закрытый бот: фиксированный белый список chat_id. Любой чужой chat_id — игнор.
+
+Хранение: notify-флаги в JSON (эфемерный на Render — после рестарта все
+notify=true). Лог событий — JSON-lines. Без SQLite.
+
+Зависимости: только стандартная библиотека Python 3.8+.
+
+Запуск:
+    PIRATE_TG_TOKEN=... python pirateswap_bot.py            # бот целиком (как на Render)
+    PIRATE_TG_TOKEN=... python pirateswap_bot.py --once     # один проход опроса, без бота
+    python pirateswap_bot.py --selftest                     # проверка логики на фейковых данных
+"""
+
+import os
+import sys
+import json
+import time
+import random
+import threading
+import datetime as dt
+import urllib.parse
+import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ============================ КОНФИГ ============================
+
+# Предметы: имя -> его marketHashNameHashCode (РОВНО ОДИН код на предмет;
+# несколько кодов через запятую дают HTTP 500).
+TARGETS = {
+    "Sealed Dead Hand Terminal": -1818601513,
+    "Fracture Case":             -87706406,
+    "Kilowatt Case":             1757559884,
+    "Revolution Case":           1299851513,
+    "Recoil Case":               29464456,
+    # Контрольный: всегда в наличии. По нему НЕ шлём дроп-алерты — только
+    # индикатор "бот видит сток" в /status и heartbeat.
+    "Prisma Case":               -2067952841,
+}
+
+CONTROL_ITEMS = {"Prisma Case"}
+
+# Закрытый бот: разрешённые chat_id (и только они).
+WHITELIST = {682446275, 770511678, 778333031}
+# Кому слать heartbeat ("бот жив"): только админ.
+ADMIN_CHAT = 770511678
+
+# Эндпоинт ОБЯЗАТЕЛЬНО с v2 (без v2 фильтр игнорируется и возвращается мусор).
+BASE_URL = "https://web.pirateswap.com/inventory/v2/ExchangerInventory"
+
+PARAMS = {
+    "orderBy": "price",
+    "sortOrder": "DESC",
+    "page": "1",
+    "results": "40",
+}
+
+# --- Темп опроса (как в рабочем оригинале — банов не ловили) ---
+POLL_MIN = 30           # пауза после полного обхода всех предметов, с
+POLL_MAX = 50
+ITEM_GAP_MIN = 3.0      # пауза между запросами разных предметов, с
+ITEM_GAP_MAX = 6.0
+
+# Анти-ложная защита: сверяем marketNameHashCode каждого предмета с ожидаемым.
+STRICT_HASH_CHECK = True
+
+HEARTBEAT_HOURS = 6     # пинг "жив" админу раз в N часов (0 = выкл)
+
+# Админ-алерт на серверные ошибки (5xx / Cloudflare 403/503). Чтобы при череде
+# ошибок не словить спам — не чаще одного сообщения раз в N минут.
+ERROR_ALERT_COOLDOWN_MIN = 15
+
+# --- Telegram: токен ТОЛЬКО из окружения, без fallback в коде ---
+TG_TOKEN = os.environ.get("PIRATE_TG_TOKEN", "").strip()
+
+# Render передаёт порт через $PORT; локально — 10000.
+HTTP_PORT = int(os.environ.get("PORT", "10000"))
+
+STATE_FILE = os.environ.get("PIRATE_STATE_FILE", "notify_state.json")
+LOG_FILE = os.environ.get("PIRATE_LOG_FILE", "events.jsonl")
+
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/149.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://pirateswap.com",
+    "Referer": "https://pirateswap.com/",
+}
+
+# ===============================================================
+# Общее состояние между потоками
+
+_state_lock = threading.Lock()       # защищает notify_state + запись STATE_FILE
+_counts_lock = threading.Lock()      # защищает last_counts / last_poll_ts
+_log_lock = threading.Lock()         # защищает запись LOG_FILE
+_err_lock = threading.Lock()         # защищает _last_err_alert
+
+_last_err_alert = None               # datetime последнего админ-алерта об ошибке
+
+notify_state = {}                    # {"<chat_id>": {"notify": bool}}
+last_counts = {mhn: None for mhn in TARGETS}   # последний известный count (None = ещё/ошибка)
+last_market_names = {}               # mhn(display) -> реальный marketHashName из API (для ссылки)
+last_poll_ts = None                  # datetime последнего успешного опроса
+
+
+def now():
+    return dt.datetime.now()
+
+
+def ts():
+    return now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg):
+    print(f"[{ts()}] {msg}", flush=True)
+
+
+def log_event(kind, **fields):
+    """Пишет строку события в JSON-lines лог (для анализа расписания)."""
+    rec = {"ts": ts(), "kind": kind}
+    rec.update(fields)
+    line = json.dumps(rec, ensure_ascii=False)
+    try:
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        log(f"⚠️ не удалось записать лог-событие: {e}")
+
+
+def item_link(name):
+    return "https://pirateswap.com/exchanger?mhn=" + urllib.parse.quote(name)
+
+
+# -------------------- notify-state (JSON) ----------------------
+
+def state_load():
+    """
+    Загружает notify-флаги. Если файла нет / битый — создаёт из белого списка
+    (все notify=true). Гарантирует, что в state есть ровно все из WHITELIST.
+    """
+    global notify_state
+    data = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            log(f"⚠️ STATE_FILE битый ({e}) — пересоздаю из белого списка.")
+            data = {}
+
+    fixed = {}
+    for cid in WHITELIST:
+        key = str(cid)
+        prev = data.get(key) if isinstance(data, dict) else None
+        notify = bool(prev.get("notify", True)) if isinstance(prev, dict) else True
+        fixed[key] = {"notify": notify}
+
+    with _state_lock:
+        notify_state = fixed
+        _state_save_locked()
+    log("notify-state загружен: " + json.dumps(notify_state, ensure_ascii=False))
+
+
+def _state_save_locked():
+    """Сохранение под уже захваченным _state_lock."""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(notify_state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log(f"⚠️ не удалось сохранить STATE_FILE: {e}")
+
+
+def set_notify(chat_id, value):
+    key = str(chat_id)
+    with _state_lock:
+        if key not in notify_state:           # не из белого списка — не трогаем
+            return False
+        notify_state[key]["notify"] = bool(value)
+        _state_save_locked()
+    return True
+
+
+def get_notify(chat_id):
+    with _state_lock:
+        rec = notify_state.get(str(chat_id))
+        return bool(rec["notify"]) if rec else False
+
+
+def notify_recipients():
+    """chat_id из белого списка, у кого notify=true."""
+    with _state_lock:
+        return [int(k) for k, v in notify_state.items() if v.get("notify")]
+
+
+# -------------------------- Telegram ---------------------------
+
+def tg_api(method, params, timeout=35):
+    """Вызов Bot API. Возвращает dict result или None при ошибке."""
+    if not TG_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode("utf-8", errors="replace"))
+        if not payload.get("ok"):
+            log(f"⚠️ TG {method} ok=false: {payload.get('description')}")
+            return None
+        return payload.get("result")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        log(f"⚠️ TG {method} HTTP {e.code}: {body}")
+        return None
+    except Exception as e:
+        log(f"⚠️ TG {method} ошибка: {e}")
+        return None
+
+
+def tg_send(chat_id, text, reply_markup=None):
+    params = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup is not None:
+        params["reply_markup"] = json.dumps(reply_markup)
+    return tg_api("sendMessage", params) is not None
+
+
+def tg_answer_callback(callback_id, text=""):
+    tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+def tg_edit_text(chat_id, message_id, text, reply_markup=None):
+    params = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup is not None:
+        params["reply_markup"] = json.dumps(reply_markup)
+    return tg_api("editMessageText", params) is not None
+
+
+def main_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "🔕 Стоп", "callback_data": "n_off"},
+        {"text": "🔔 Старт", "callback_data": "n_on"},
+    ]]}
+
+
+def admin_error_alert(detail):
+    """Шлёт админу ЛС о серверной ошибке, но не чаще ERROR_ALERT_COOLDOWN_MIN.
+    Между алертами копит, сколько ошибок было подавлено, и сообщает это."""
+    global _last_err_alert
+    if not ADMIN_CHAT:
+        return
+    with _err_lock:
+        n = now()
+        if _last_err_alert is not None:
+            mins = (n - _last_err_alert).total_seconds() / 60
+            if mins < ERROR_ALERT_COOLDOWN_MIN:
+                return                      # ещё в кулдауне — молчим
+        _last_err_alert = n
+    tg_send(ADMIN_CHAT, f"🛑 Серверная ошибка PirateSwap:\n{detail}\n"
+                        f"(следующее такое уведомление — не раньше чем через "
+                        f"{ERROR_ALERT_COOLDOWN_MIN} мин)")
+
+
+def broadcast_drop(text):
+    """Шлёт алерт всем из белого списка, у кого notify=true."""
+    recips = notify_recipients()
+    sent = 0
+    for cid in recips:
+        if tg_send(cid, text, reply_markup=None):
+            sent += 1
+        time.sleep(0.2)   # бережём лимит Telegram
+    log(f"📤 алерт разослан: {sent}/{len(recips)} получателей")
+    return sent
+
+
+# --------------------------- Запросы ---------------------------
+
+def build_url(name, code):
+    params = dict(PARAMS)
+    params["searchPhrase"] = name
+    params["marketHashNameHashCodes"] = str(int(code))
+    return BASE_URL + "?" + urllib.parse.urlencode(params, safe=",")
+
+
+def fetch(name, code):
+    """
+    Возвращает (items_out:list[dict], foreign:int).
+    items_out: [{"id", "price", "tradableAfter", "name"}] — только СВОИ предметы.
+    foreign — сколько отброшено как чужие (не тот hash code).
+    Бросает исключение при сетевой/HTTP ошибке.
+    """
+    url = build_url(name, code)
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read().decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    items = data.get("items") or []   # totalResults/totalPages баговые — не трогаем
+
+    allowed = int(code)
+    out = []
+    foreign = 0
+    for it in items:
+        if STRICT_HASH_CHECK:
+            ihash = it.get("marketNameHashCode")
+            if ihash is not None and int(ihash) != allowed:
+                foreign += 1
+                continue
+        aid = it.get("assetId", it.get("id"))
+        if aid is None:
+            continue
+        out.append({
+            "id": str(aid),
+            "price": it.get("price"),
+            "tradableAfter": it.get("tradableAfter"),
+            "name": it.get("marketHashName"),
+        })
+    return out, foreign
+
+
+def format_price(p):
+    if p is None:
+        return "?"
+    try:
+        return f"{float(p):.2f}"
+    except (TypeError, ValueError):
+        return str(p)
+
+
+def build_alert(display_name, items, new_items):
+    """Текст дроп-алерта по требованиям ТЗ."""
+    market_name = next((i["name"] for i in items if i.get("name")), display_name)
+    count = len(items)
+    prices = [i["price"] for i in items if i.get("price") is not None]
+    price_line = ""
+    if prices:
+        try:
+            price_line = f"\n💰 от {format_price(min(prices, key=float))}"
+        except (TypeError, ValueError):
+            price_line = f"\n💰 {format_price(prices[0])}"
+
+    # tradableAfter — только если есть в данных у новых предметов.
+    ta = next((i["tradableAfter"] for i in new_items
+               if i.get("tradableAfter")), None)
+    ta_line = f"\n🔒 tradableAfter: {ta}" if ta else ""
+
+    return (f"🔥 ДРОП! {display_name}\n"
+            f"📦 в наличии: {count} (новых: {len(new_items)})"
+            f"{price_line}{ta_line}\n"
+            f"{item_link(market_name)}")
+
+
+# --------------------- Обработка одного предмета ----------------
+
+def poll_one(mhn, code, st):
+    try:
+        items, foreign = fetch(mhn, code)
+        st["backoff"] = max(0, st["backoff"] - 5)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            st["backoff"] = min(st["backoff"] + 60, 600)
+            log(f"[{mhn}] 429 rate limit (+{st['backoff']}s)")
+        elif e.code in (403, 503):
+            st["backoff"] = min(st["backoff"] + 90, 600)
+            log(f"[{mhn}] HTTP {e.code} (Cloudflare?) (+{st['backoff']}s)")
+            admin_error_alert(f"[{mhn}] HTTP {e.code} (Cloudflare блокирует?)")
+        elif 500 <= e.code < 600:
+            st["backoff"] = min(st["backoff"] + 30, 300)
+            log(f"[{mhn}] HTTP {e.code} (ошибка сервера) (+{st['backoff']}s)")
+            admin_error_alert(f"[{mhn}] HTTP {e.code} (ошибка сервера)")
+        else:
+            st["backoff"] = min(st["backoff"] + 15, 300)
+            log(f"[{mhn}] HTTP {e.code} (+{st['backoff']}s)")
+        log_event("error", mhn=mhn, http=e.code)
+        return None
+    except Exception as e:
+        st["backoff"] = min(st["backoff"] + 15, 300)
+        log(f"[{mhn}] Ошибка: {e} (+{st['backoff']}s)")
+        log_event("error", mhn=mhn, msg=str(e))
+        return None
+
+    if foreign > 0:
+        log(f"[{mhn}] ⚠️ отброшено чужих предметов: {foreign} (алерт по ним НЕ шлю)")
+        log_event("mismatch", mhn=mhn, count=foreign)
+
+    cur_ids = {i["id"] for i in items}
+    count = len(cur_ids)
+    is_control = mhn in CONTROL_ITEMS
+
+    # Запоминаем реальное имя для ссылки.
+    rn = next((i["name"] for i in items if i.get("name")), None)
+    if rn:
+        last_market_names[mhn] = rn
+
+    prev_ids = st["prev_ids"]
+    new_ids = cur_ids - prev_ids
+
+    if new_ids and not is_control:
+        new_items = [i for i in items if i["id"] in new_ids]
+        msg = build_alert(mhn, items, new_items)
+        log(f"[{mhn}] 🔥 ДРОП: новых {len(new_ids)}, всего {count}")
+        log_event("drop", mhn=mhn, count=count, new_count=len(new_ids),
+                  asset_ids=sorted(new_ids))
+        broadcast_drop(msg)
+
+    if not cur_ids and prev_ids and not is_control:
+        log(f"[{mhn}] закончился (был {len(prev_ids)}).")
+        log_event("soldout", mhn=mhn)
+
+    st["prev_ids"] = cur_ids
+
+    with _counts_lock:
+        global last_poll_ts
+        last_counts[mhn] = count
+        last_poll_ts = now()
+
+    return count
+
+
+# ------------------------ Поток-поллер -------------------------
+
+def make_states():
+    return {mhn: {"prev_ids": set(), "backoff": 0} for mhn in TARGETS}
+
+
+def initial_scan(states):
+    """Тихий baseline: фиксируем текущие assetId БЕЗ алертов (чтобы не спамить
+    при каждом рестарте Render). Алерты — только на дропы ПОСЛЕ старта."""
+    log("Тихий стартовый скан (baseline, без алертов)...")
+    for mhn, code in TARGETS.items():
+        try:
+            items, foreign = fetch(mhn, code)
+            ids = {i["id"] for i in items}
+            states[mhn]["prev_ids"] = ids
+            rn = next((i["name"] for i in items if i.get("name")), None)
+            if rn:
+                last_market_names[mhn] = rn
+            with _counts_lock:
+                last_counts[mhn] = len(ids)
+            extra = f" (чужих отброшено: {foreign})" if foreign else ""
+            tag = " [контроль]" if mhn in CONTROL_ITEMS else ""
+            log(f"[{mhn}] baseline: {len(ids)} шт.{extra}{tag}")
+        except Exception as e:
+            log(f"[{mhn}] стартовый запрос не удался: {e}")
+        time.sleep(random.uniform(ITEM_GAP_MIN, ITEM_GAP_MAX))
+    with _counts_lock:
+        global last_poll_ts
+        last_poll_ts = now()
+
+
+def poller_loop():
+    log("Поток-поллер запущен. Цели: " + ", ".join(TARGETS))
+    log("Пример URL: " + build_url(*next(iter(TARGETS.items()))))
+    states = make_states()
+    initial_scan(states)
+    log_event("startup")
+    if ADMIN_CHAT:
+        tg_send(ADMIN_CHAT, "🟢 Бот запущен. Мониторинг идёт постоянно.\nСлежу за:\n• "
+                + "\n• ".join(m for m in TARGETS if m not in CONTROL_ITEMS))
+    last_hb = now()
+
+    while True:
+        for mhn, code in TARGETS.items():
+            if states[mhn]["backoff"] > 0:
+                time.sleep(states[mhn]["backoff"])
+            try:
+                poll_one(mhn, code, states[mhn])
+            except Exception as e:
+                log(f"[{mhn}] непойманная ошибка в poll_one: {e}")
+            time.sleep(random.uniform(ITEM_GAP_MIN, ITEM_GAP_MAX))
+
+        if HEARTBEAT_HOURS > 0 and ADMIN_CHAT:
+            if (now() - last_hb).total_seconds() / 3600 >= HEARTBEAT_HOURS:
+                with _counts_lock:
+                    summary = ", ".join(
+                        f"{m}: {last_counts.get(m) if last_counts.get(m) is not None else '?'}"
+                        for m in TARGETS)
+                tg_send(ADMIN_CHAT, "❤️ Бот жив. В наличии — " + summary)
+                log_event("heartbeat")
+                last_hb = now()
+
+        time.sleep(random.uniform(POLL_MIN, POLL_MAX))
+
+
+# ----------------------- Поток Telegram ------------------------
+
+WELCOME = (
+    "🏴‍☠️ PirateSwap-бот (закрытый).\n\n"
+    "Я слежу за появлением кейсов и пришлю алерт, как только что-то дропнется. "
+    "Мониторинг работает всегда — кнопки ниже включают/выключают уведомления "
+    "ЛИЧНО для тебя, на других и на мониторинг не влияют.\n\n"
+    "Команды:\n"
+    "• /status — что сейчас в наличии + твой статус\n"
+    "• кнопки 🔕/🔔 — выкл/вкл уведомления для себя"
+)
+
+
+def status_text(chat_id):
+    with _counts_lock:
+        counts = dict(last_counts)
+        poll_ts = last_poll_ts
+    age = ""
+    if poll_ts:
+        mins = (now() - poll_ts).total_seconds() / 60
+        age = f" (обновлено {int(mins)} мин назад)" if mins >= 1 else " (только что)"
+
+    lines = [f"📊 Наличие{age}:"]
+    for mhn in TARGETS:
+        c = counts.get(mhn)
+        shown = "?" if c is None else str(c)
+        if mhn in CONTROL_ITEMS:
+            mark = " ✅ бот видит сток" if (c or 0) > 0 else " ⚠️ контроль пуст!"
+            lines.append(f"• {mhn}: {shown}{mark} (контроль)")
+        else:
+            lines.append(f"• {mhn}: {shown}")
+
+    on = get_notify(chat_id)
+    lines.append("")
+    lines.append(f"🔔 Твои уведомления: {'ВКЛ' if on else 'ВЫКЛ'}")
+    return "\n".join(lines)
+
+
+def handle_message(msg):
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+    if chat_id not in WHITELIST:
+        log(f"⛔ сообщение от чужого chat_id={chat_id} ({text[:40]!r}) — игнор")
+        log_event("denied", chat_id=chat_id)
+        return
+
+    cmd = text.split()[0].lower() if text else ""
+    if cmd.startswith("/start"):
+        set_notify(chat_id, True)   # активация чата; уведомления по умолчанию вкл
+        tg_send(chat_id, WELCOME, reply_markup=main_keyboard())
+    elif cmd.startswith("/status"):
+        tg_send(chat_id, status_text(chat_id), reply_markup=main_keyboard())
+    elif cmd.startswith("/stop"):
+        set_notify(chat_id, False)
+        tg_send(chat_id, "🔕 Уведомления выключены. Мониторинг продолжается.",
+                reply_markup=main_keyboard())
+    elif cmd.startswith("/go") or cmd.startswith("/resume"):
+        set_notify(chat_id, True)
+        tg_send(chat_id, "🔔 Уведомления включены.", reply_markup=main_keyboard())
+    else:
+        tg_send(chat_id, "Команды: /status, или кнопки ниже.",
+                reply_markup=main_keyboard())
+
+
+def handle_callback(cb):
+    cb_id = cb.get("id")
+    msg = cb.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = msg.get("message_id")
+    data = cb.get("data") or ""
+
+    if chat_id not in WHITELIST:
+        tg_answer_callback(cb_id, "Доступ закрыт")
+        log(f"⛔ callback от чужого chat_id={chat_id} — игнор")
+        return
+
+    if data == "n_off":
+        set_notify(chat_id, False)
+        tg_answer_callback(cb_id, "Уведомления выключены")
+    elif data == "n_on":
+        set_notify(chat_id, True)
+        tg_answer_callback(cb_id, "Уведомления включены")
+    else:
+        tg_answer_callback(cb_id)
+        return
+
+    on = get_notify(chat_id)
+    new_text = f"🔔 Твои уведомления: {'ВКЛ' if on else 'ВЫКЛ'}\nМониторинг идёт постоянно."
+    if not tg_edit_text(chat_id, message_id, new_text, reply_markup=main_keyboard()):
+        tg_send(chat_id, new_text, reply_markup=main_keyboard())
+
+
+def telegram_loop():
+    if not TG_TOKEN:
+        log("⚠️ PIRATE_TG_TOKEN не задан — поток Telegram не запускаю.")
+        return
+    log("Поток Telegram (getUpdates long-polling) запущен.")
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])}
+            if offset is not None:
+                params["offset"] = offset
+            updates = tg_api("getUpdates", params, timeout=40)
+            if not updates:
+                if updates is None:
+                    time.sleep(3)   # ошибка API — короткая пауза
+                continue
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                try:
+                    if "message" in upd:
+                        handle_message(upd["message"])
+                    elif "callback_query" in upd:
+                        handle_callback(upd["callback_query"])
+                except Exception as e:
+                    log(f"⚠️ ошибка обработки апдейта: {e}")
+        except Exception as e:
+            log(f"⚠️ telegram_loop сбой: {e}")
+            time.sleep(5)
+
+
+# ------------------------- HTTP /health ------------------------
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            self._send(200, "OK")
+        elif self.path == "/":
+            with _counts_lock:
+                poll_ts = last_poll_ts
+                counts = dict(last_counts)
+            age = "никогда" if not poll_ts else poll_ts.strftime("%H:%M:%S")
+            body = "PirateSwap bot alive. Last poll: " + age + "\n" + \
+                   "\n".join(f"{m}: {counts.get(m)}" for m in TARGETS)
+            self._send(200, body)
+        else:
+            self._send(404, "not found")
+
+    def log_message(self, *args):
+        pass   # глушим access-лог http.server
+
+
+def run_http():
+    srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)
+    log(f"HTTP-сервер слушает 0.0.0.0:{HTTP_PORT} (/health -> 200).")
+    srv.serve_forever()
+
+
+# ------------------------- self-test ---------------------------
+
+def _selftest():
+    """Проверка ключевой логики на фейковых данных (без сети)."""
+    print("== self-test ==")
+    ok = True
+
+    # 1. build_url содержит v2 и ровно один код.
+    url = build_url("Fracture Case", -87706406)
+    assert "/inventory/v2/ExchangerInventory" in url, "нет v2 в URL"
+    assert "marketHashNameHashCodes=-87706406" in url, "код не подставился"
+    assert url.count("marketHashNameHashCodes") == 1
+    print("  [ok] build_url: v2 + один код")
+
+    # 2. Анти-ложная защита: чужой marketNameHashCode отбрасывается.
+    fake = {
+        "items": [
+            {"assetId": "A1", "marketNameHashCode": -87706406, "price": 5.0,
+             "marketHashName": "Fracture Case"},
+            {"assetId": "X9", "marketNameHashCode": 111111, "price": 1.0,
+             "marketHashName": "Чужой предмет"},   # ДОЛЖЕН быть отброшен
+        ]
+    }
+    orig = urllib.request.urlopen
+
+    class _Resp:
+        def __init__(self, b): self._b = b
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    urllib.request.urlopen = lambda *a, **k: _Resp(json.dumps(fake).encode())
+    try:
+        items, foreign = fetch("Fracture Case", -87706406)
+    finally:
+        urllib.request.urlopen = orig
+    assert foreign == 1, f"чужой не отброшен (foreign={foreign})"
+    assert {i['id'] for i in items} == {"A1"}, "остались не те id"
+    print("  [ok] анти-ложная защита: чужой hash отброшен")
+
+    # 3. Детект дропа по разнице множеств.
+    st = {"prev_ids": {"A1"}, "backoff": 0}
+    cur = {"A1", "A2"}
+    new = cur - st["prev_ids"]
+    assert new == {"A2"}, "детект новых assetId сломан"
+    print("  [ok] детект: новые assetId = дроп")
+
+    # 4. Контрольный предмет не порождает дроп-алерт.
+    assert "Prisma Case" in CONTROL_ITEMS
+    print("  [ok] Prisma — контрольный (без дроп-алертов)")
+
+    # 5. build_alert: tradableAfter только если есть.
+    items_ta = [{"id": "A2", "price": 7.5, "tradableAfter": "2026-07-01",
+                 "name": "Fracture Case"}]
+    a = build_alert("Fracture Case", items_ta, items_ta)
+    assert "tradableAfter" in a and "2026-07-01" in a
+    items_no = [{"id": "A3", "price": 7.5, "tradableAfter": None,
+                 "name": "Fracture Case"}]
+    b = build_alert("Fracture Case", items_no, items_no)
+    assert "tradableAfter" not in b, "tradableAfter не должен упоминаться"
+    assert "exchanger?mhn=" in b
+    print("  [ok] build_alert: tradableAfter условно, ссылка есть")
+
+    # 6. notify-флаги: чужой chat_id не добавляется.
+    global notify_state
+    notify_state = {str(c): {"notify": True} for c in WHITELIST}
+    assert set_notify(99999, False) is False, "чужой chat_id не должен меняться"
+    assert set_notify(ADMIN_CHAT, False) is True
+    assert get_notify(ADMIN_CHAT) is False
+    set_notify(ADMIN_CHAT, True)
+    print("  [ok] notify: белый список закрыт, флаг переключается")
+
+    print("== self-test passed ==" if ok else "== FAILED ==")
+
+
+# ------------------------------ main ---------------------------
+
+def run_once():
+    log("Один проход опроса (--once), без бота.")
+    states = make_states()
+    for mhn, code in TARGETS.items():
+        try:
+            items, foreign = fetch(mhn, code)
+            extra = f"  | чужих отброшено: {foreign}" if foreign else ""
+            log(f"[{mhn}] в наличии: {len(items)} шт.{extra}")
+        except Exception as e:
+            log(f"[{mhn}] ошибка: {e}")
+        time.sleep(random.uniform(ITEM_GAP_MIN, ITEM_GAP_MAX))
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--selftest":
+        _selftest()
+        return
+    if arg == "--once":
+        run_once()
+        return
+
+    if not TG_TOKEN:
+        log("❌ PIRATE_TG_TOKEN не задан. Установи переменную окружения и перезапусти.")
+        sys.exit(1)
+
+    state_load()
+
+    threading.Thread(target=poller_loop, name="poller", daemon=True).start()
+    threading.Thread(target=telegram_loop, name="telegram", daemon=True).start()
+
+    try:
+        run_http()   # блокирующий, держит процесс живым
+    except KeyboardInterrupt:
+        log("Остановлено пользователем.")
+
+
+if __name__ == "__main__":
+    main()

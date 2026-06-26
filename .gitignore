@@ -1,0 +1,8 @@
+# Локальные артефакты — НЕ коммитить
+notify_state.json
+notify_state.json.tmp
+events.jsonl
+pirateswap_drops.db
+__pycache__/
+*.pyc
+.env

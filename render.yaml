@@ -1,0 +1,14 @@
+# Render Blueprint. Можно задеплоить через "New + > Blueprint",
+# либо настроить Web Service вручную (см. README).
+services:
+  - type: web
+    name: pirateswap-bot
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"   # зависимостей нет, но команда нужна
+    startCommand: "python pirateswap_bot.py"
+    envVars:
+      - key: PIRATE_TG_TOKEN
+        sync: false        # значение вводишь в дашборде Render, НЕ в коде
+      - key: PYTHON_VERSION
+        value: "3.12.4"
