@@ -273,6 +273,11 @@ def main_keyboard():
     ]]}
 
 
+# Гасит старую reply-клавиатуру (от прежнего бота). Нельзя совмещать в одном
+# сообщении с inline-кнопками — поэтому шлётся отдельным сообщением.
+REMOVE_KEYBOARD = {"remove_keyboard": True}
+
+
 def admin_error_alert(detail):
     """Шлёт админу ЛС о серверной ошибке, но не чаще ERROR_ALERT_COOLDOWN_MIN.
     Между алертами копит, сколько ошибок было подавлено, и сообщает это."""
@@ -561,6 +566,10 @@ def handle_message(msg):
     cmd = text.split()[0].lower() if text else ""
     if cmd.startswith("/start"):
         set_notify(chat_id, True)   # активация чата; уведомления по умолчанию вкл
+        # Сначала убираем старую reply-клавиатуру от прежнего бота...
+        tg_send(chat_id, "♻️ Обновляю бота, убираю старую клавиатуру.",
+                reply_markup=REMOVE_KEYBOARD)
+        # ...затем приветствие с актуальными inline-кнопками.
         tg_send(chat_id, WELCOME, reply_markup=main_keyboard())
     elif cmd.startswith("/status"):
         tg_send(chat_id, status_text(chat_id), reply_markup=main_keyboard())
