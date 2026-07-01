@@ -99,14 +99,23 @@ LOG_FILE = os.environ.get("PIRATE_LOG_FILE", "events.jsonl")
 # ---------------------- АВТОПОКУПКА ----------------------------
 # Бот сам оформляет покупку в момент детекта (POST /Exchange/start/v2/{steamid}).
 # ⚠️ Тратит реальные деньги и почти наверняка против ToS PirateSwap (риск бана).
-# Всё выключено по умолчанию. Порядок обкатки:
-#   1) AUTOBUY_ENABLED=1 (остальное по умолчанию) -> DRY-RUN: только логирует
-#      «купил бы X за Y», НИЧЕГО не тратит. Убеждаешься, что логика верна.
-#   2) Задаёшь AUTOBUY_MAX_PRICE и, когда готов, AUTOBUY_DRY_RUN=0 -> боевой режим.
-# Kill switch: AUTOBUY_ENABLED=0 мгновенно выключает покупки (мониторинг живёт).
+#
+# ДВОЙНОЙ ПРЕДОХРАНИТЕЛЬ:
+#   1) AUTOBUY_ENABLED (env) — мастер-переключатель фичи. По умолчанию 0.
+#   2) «Вооружение ценой» — даже при AUTOBUY_ENABLED=1 бот НИЧЕГО не покупает,
+#      пока админ не задаст цену командой /setprice X в Telegram. Цена живёт
+#      в памяти и СБРАСЫВАЕТСЯ при рестарте — после каждого перезапуска бот
+#      снова «ждёт цену» и не покупает, пока ты её заново не выставишь.
+# Kill switch: AUTOBUY_ENABLED=0 или /buyoff — покупки выкл (мониторинг живёт).
 AUTOBUY_ENABLED = os.environ.get("AUTOBUY_ENABLED", "0") == "1"
 AUTOBUY_DRY_RUN = os.environ.get("AUTOBUY_DRY_RUN", "1") != "0"     # по умолч. симуляция
-AUTOBUY_MAX_PRICE = float(os.environ.get("AUTOBUY_MAX_PRICE", "0") or 0)  # потолок цены; 0 = ничего не купит
+# Какие предметы вообще разрешено автопокупать (по display-имени). Для теста —
+# только Revolution Case. Можно переопределить env-ом (через запятую).
+AUTOBUY_ITEMS = {s.strip() for s in
+                 os.environ.get("AUTOBUY_ITEMS", "Revolution Case").split(",")
+                 if s.strip()}
+# Необязательный жёсткий потолок для /setprice (защита от опечатки). 0 = без потолка.
+AUTOBUY_MAX_PRICE = float(os.environ.get("AUTOBUY_MAX_PRICE", "0") or 0)
 AUTOBUY_DAILY_LIMIT = int(os.environ.get("AUTOBUY_DAILY_LIMIT", "20") or 20)  # макс покупок в сутки
 AUTOBUY_PRICE_FIELD = os.environ.get("AUTOBUY_PRICE_FIELD", "price")   # какое поле цены слать: price | storePrice
 PIRATE_BEARER = os.environ.get("PIRATE_BEARER", "").strip()           # Bearer-токен сайта (протухает!)
@@ -419,6 +428,21 @@ _buy_lock = threading.Lock()
 _buy_day = None                  # дата, к которой относится счётчик
 _buy_count = 0                   # сколько куплено за текущие сутки
 
+_arm_lock = threading.Lock()
+_armed_price = None              # None = разоружён (ждёт цену); float = макс. цена покупки
+
+
+def get_armed_price():
+    with _arm_lock:
+        return _armed_price
+
+
+def set_armed_price(price):
+    """price=float — вооружить с этой макс. ценой; None — разоружить."""
+    global _armed_price
+    with _arm_lock:
+        _armed_price = price
+
 
 def build_purchase_body(item):
     """Тело POST /Exchange/start/v2 — покупка одного предмета по его itemId (GUID)."""
@@ -484,10 +508,19 @@ def _daily_inc():
 
 
 def try_autobuy(mhn, new_items):
-    """Пытается купить самый дешёвый из новых предметов в пределах потолка.
-    Возвращает строку-результат для алерта, либо None (автопокупка выключена)."""
+    """Пытается купить самый дешёвый из новых предметов в пределах заданной
+    цены. Возвращает строку-результат ДЛЯ АДМИНА, либо None (не наш случай)."""
     if not AUTOBUY_ENABLED:
         return None
+    # Покупаем только разрешённые предметы (для теста — только Revolution Case).
+    if mhn not in AUTOBUY_ITEMS:
+        return None
+
+    # «Вооружение»: пока админ не задал цену (/setprice), НИЧЕГО не покупаем.
+    armed = get_armed_price()
+    if armed is None:
+        log(f"[{mhn}] autobuy: не вооружён — жду цену (/setprice X)")
+        return f"⏳ {mhn} дропнулся, но автозакупка не вооружена — задай /setprice X"
 
     cands = [i for i in new_items
              if i.get("itemId") and i.get(AUTOBUY_PRICE_FIELD) is not None]
@@ -496,11 +529,11 @@ def try_autobuy(mhn, new_items):
         return None
 
     cand = next((i for i in cands
-                 if float(i[AUTOBUY_PRICE_FIELD]) <= AUTOBUY_MAX_PRICE), None)
+                 if float(i[AUTOBUY_PRICE_FIELD]) <= armed), None)
     if cand is None:
         cheapest = cands[0][AUTOBUY_PRICE_FIELD]
-        log(f"[{mhn}] autobuy: пропуск, цена {cheapest} > потолка {AUTOBUY_MAX_PRICE}")
-        return f"🛑 автопокупка: цена {cheapest} выше потолка {AUTOBUY_MAX_PRICE}"
+        log(f"[{mhn}] autobuy: пропуск, цена {cheapest} > твоей {armed}")
+        return f"🛑 {mhn}: цена {cheapest} выше твоей {armed} — не купил"
 
     price = cand[AUTOBUY_PRICE_FIELD]
 
@@ -654,10 +687,17 @@ def poller_loop():
         log("Автопокупка: ВЫКЛ (только алерты).")
     else:
         mode = "DRY-RUN (симуляция)" if AUTOBUY_DRY_RUN else "БОЕВОЙ (тратит деньги!)"
-        log(f"Автопокупка: ВКЛ [{mode}] price_field={AUTOBUY_PRICE_FIELD} "
-            f"max_price={AUTOBUY_MAX_PRICE} daily_limit={AUTOBUY_DAILY_LIMIT} "
+        items = ", ".join(sorted(AUTOBUY_ITEMS))
+        log(f"Автопокупка: ВКЛ [{mode}] предметы={items} "
+            f"price_field={AUTOBUY_PRICE_FIELD} daily_limit={AUTOBUY_DAILY_LIMIT} "
             f"token={'есть' if PIRATE_BEARER else 'НЕТ'} "
-            f"steamid={'есть' if PIRATE_STEAMID else 'НЕТ'}")
+            f"steamid={'есть' if PIRATE_STEAMID else 'НЕТ'} "
+            f"| РАЗОРУЖЕНА, жду /setprice")
+        # После рестарта бот всегда разоружён — напоминаем админу задать цену.
+        if ADMIN_CHAT:
+            tg_send(ADMIN_CHAT, f"🛒 Автозакупка включена [{mode}], предметы: {items}.\n"
+                                f"⏳ Сейчас РАЗОРУЖЕНА (после рестарта). "
+                                f"Чтобы начать покупать — задай цену: /setprice <цена>")
     if ADMIN_CHAT:
         tg_send(ADMIN_CHAT, "🟢 Бот запущен. Мониторинг идёт постоянно.\nСлежу за:\n• "
                 + "\n• ".join(m for m in TARGETS if m not in CONTROL_ITEMS))
@@ -715,6 +755,71 @@ WELCOME = (
 )
 
 
+def autobuy_state_line():
+    """Однострочное (многострочное) описание состояния автозакупки — для админа."""
+    if not AUTOBUY_ENABLED:
+        return "🛒 Автозакупка: ВЫКЛ в конфиге (AUTOBUY_ENABLED=0)"
+    mode = "DRY-RUN (симуляция)" if AUTOBUY_DRY_RUN else "БОЕВОЙ (реальные покупки!)"
+    items = ", ".join(sorted(AUTOBUY_ITEMS))
+    armed = get_armed_price()
+    if armed is None:
+        return (f"🛒 Автозакупка: ⏳ ЖДЁТ ЦЕНУ [{mode}]\n"
+                f"Предметы: {items}\nВооружить: /setprice <цена>")
+    return (f"🛒 Автозакупка: 🟢 ВООРУЖЕНА, цена ≤ {armed} [{mode}]\n"
+            f"Предметы: {items}\nВыключить: /buyoff")
+
+
+def _parse_price(text):
+    """Достаёт число из '/setprice 1,5' -> 1.5. Возвращает float>0 или None."""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    raw = parts[1].strip().replace(",", ".").replace("$", "").strip()
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+def _cmd_setprice(chat_id, text):
+    if chat_id != ADMIN_CHAT:
+        tg_send(chat_id, "Эта команда доступна только админу.")
+        return
+    if not AUTOBUY_ENABLED:
+        tg_send(chat_id, "Автозакупка выключена в конфиге (AUTOBUY_ENABLED=0).")
+        return
+    price = _parse_price(text)
+    if price is None:
+        tg_send(chat_id, "Формат: /setprice 1.5  — макс. цена покупки.")
+        return
+    if AUTOBUY_MAX_PRICE > 0 and price > AUTOBUY_MAX_PRICE:
+        tg_send(chat_id, f"Цена {price} выше жёсткого потолка {AUTOBUY_MAX_PRICE}. Понизь.")
+        return
+    set_armed_price(price)
+    log_event("autobuy_armed", price=price)
+    mode = "DRY-RUN (симуляция)" if AUTOBUY_DRY_RUN else "БОЕВОЙ (реальные покупки!)"
+    items = ", ".join(sorted(AUTOBUY_ITEMS))
+    tg_send(chat_id, f"🟢 Вооружена: покупаю {items} по цене ≤ {price}\n"
+                     f"Режим: {mode}\nВыключить: /buyoff")
+
+
+def _cmd_buyoff(chat_id):
+    if chat_id != ADMIN_CHAT:
+        tg_send(chat_id, "Эта команда доступна только админу.")
+        return
+    set_armed_price(None)
+    log_event("autobuy_disarmed")
+    tg_send(chat_id, "⏸ Автозакупка выключена — жду цену. Возобновить: /setprice <цена>")
+
+
+def _cmd_buystatus(chat_id):
+    if chat_id != ADMIN_CHAT:
+        tg_send(chat_id, "Эта команда доступна только админу.")
+        return
+    tg_send(chat_id, autobuy_state_line())
+
+
 def status_text(chat_id):
     with _counts_lock:
         counts = dict(last_counts)
@@ -737,6 +842,9 @@ def status_text(chat_id):
     on = get_notify(chat_id)
     lines.append("")
     lines.append(f"🔔 Твои уведомления: {'ВКЛ' if on else 'ВЫКЛ'}")
+    if chat_id == ADMIN_CHAT and AUTOBUY_ENABLED:
+        lines.append("")
+        lines.append(autobuy_state_line())
     return "\n".join(lines)
 
 
@@ -766,6 +874,12 @@ def handle_message(msg):
     elif cmd.startswith("/go") or cmd.startswith("/resume"):
         set_notify(chat_id, True)
         tg_send(chat_id, "🔔 Уведомления включены.", reply_markup=main_keyboard())
+    elif cmd in ("/setprice", "/price", "/buy"):
+        _cmd_setprice(chat_id, text)
+    elif cmd in ("/buyoff", "/stopbuy"):
+        _cmd_buyoff(chat_id)
+    elif cmd == "/buystatus":
+        _cmd_buystatus(chat_id)
     else:
         tg_send(chat_id, "Команды: /status, или кнопки ниже.",
                 reply_markup=main_keyboard())
@@ -944,21 +1058,29 @@ def _selftest():
     assert body["balanceValue"] == body["botInventoryItems"][0]["price"]
     print("  [ok] build_purchase_body: itemId + цена + balanceValue")
 
-    # 5d. try_autobuy DRY-RUN: не тратит, уважает потолок цены.
-    global AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE
-    _sv = (AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE)
+    # 5d. Автозакупка: вооружение ценой, потолок, whitelist предметов, kill-switch.
+    global AUTOBUY_ENABLED, AUTOBUY_DRY_RUN
+    _sv = (AUTOBUY_ENABLED, AUTOBUY_DRY_RUN)
+    ritem = dict(item, name="Revolution Case")     # цена 0.43, в списке разрешённых
     try:
-        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE = True, True, 1.0
-        r = try_autobuy("Recoil Case", [item])
+        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN = True, True
+        set_armed_price(None)                      # разоружён -> ждёт цену, НЕ покупает
+        r0 = try_autobuy("Revolution Case", [ritem])
+        assert r0 and "не вооружена" in r0, f"disarmed не сработал: {r0}"
+        set_armed_price(1.0)                        # 0.43 <= 1.0 -> dry-run покупка
+        r = try_autobuy("Revolution Case", [ritem])
         assert r and "dry-run" in r, f"dry-run не сработал: {r}"
-        AUTOBUY_MAX_PRICE = 0.1                     # ниже цены 0.43 -> не купит
-        r2 = try_autobuy("Recoil Case", [item])
-        assert r2 and "потолка" in r2, f"потолок не сработал: {r2}"
+        set_armed_price(0.1)                        # 0.43 > 0.1 -> не купит
+        r2 = try_autobuy("Revolution Case", [ritem])
+        assert r2 and "выше" in r2, f"потолок не сработал: {r2}"
+        set_armed_price(1.0)
+        assert try_autobuy("Fracture Case", [ritem]) is None   # не в AUTOBUY_ITEMS
         AUTOBUY_ENABLED = False                     # выключено -> None
-        assert try_autobuy("Recoil Case", [item]) is None
+        assert try_autobuy("Revolution Case", [ritem]) is None
     finally:
-        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE = _sv
-    print("  [ok] автопокупка: dry-run, потолок цены, kill-switch")
+        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN = _sv
+        set_armed_price(None)
+    print("  [ok] автозакупка: вооружение ценой, потолок, whitelist, kill-switch")
 
     # 6. notify-флаги: чужой chat_id не добавляется.
     global notify_state
