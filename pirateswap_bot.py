@@ -587,12 +587,17 @@ def poll_one(mhn, code, st):
         log(f"[{mhn}] 🔥 ДРОП: новых {len(new_ids)}, всего {count}")
         log_event("drop", mhn=mhn, count=count, new_count=len(new_ids),
                   asset_ids=sorted(new_ids))
-        # Автопокупка — ПЕРВЫМ делом (миллисекунды решают), потом уже алерт.
+        # Автопокупка — ПЕРВЫМ делом (миллисекунды решают). Идёт на аккаунте
+        # админа, поэтому её результат уходит ТОЛЬКО ему (ниже).
         buy_result = try_autobuy(mhn, new_items)
-        msg = build_alert(mhn, items, new_items)
-        if buy_result:
-            msg += "\n" + buy_result
-        broadcast_drop(msg, reply_markup=buy_keyboard(market_name))
+        # Уведомление о дропе — всем с notify=true (двое + админ, если не приглушил),
+        # с кнопкой ручной покупки.
+        broadcast_drop(build_alert(mhn, items, new_items),
+                       reply_markup=buy_keyboard(market_name))
+        # Результат закупки — только админу и ВСЕГДА (даже если он приглушил
+        # уведомления кнопкой 🔕: так он может получать только закупки).
+        if buy_result and ADMIN_CHAT:
+            tg_send(ADMIN_CHAT, "🛒 " + buy_result)
 
     if not cur_ids and prev_ids and not is_control:
         log(f"[{mhn}] закончился (был {len(prev_ids)}).")
