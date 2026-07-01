@@ -68,11 +68,15 @@ PARAMS = {
     "results": "40",
 }
 
-# --- Темп опроса (как в рабочем оригинале — банов не ловили) ---
-POLL_MIN = 30           # пауза после полного обхода всех предметов, с
-POLL_MAX = 50
-ITEM_GAP_MIN = 3.0      # пауза между запросами разных предметов, с
+# --- Темп опроса (round-robin: ровный поток запросов без длинных простоев) ---
+# Пауза между отдельными запросами. При 5 боевых предметах каждый
+# перепроверяется ~раз в 5*avg(GAP) ≈ 25 с (раньше было ~70 с из-за паузы
+# между обходами). Быстрее детект — больше шанс успеть купить.
+ITEM_GAP_MIN = 4.0
 ITEM_GAP_MAX = 6.0
+# Контрольный Prisma опрашивается редко (он всегда в наличии, боевого смысла нет)
+# — чтобы не тратить на него слоты round-robin. Раз в N секунд.
+CONTROL_EVERY_SEC = 600
 
 # Анти-ложная защита: сверяем marketNameHashCode каждого предмета с ожидаемым.
 STRICT_HASH_CHECK = True
@@ -296,12 +300,19 @@ def admin_error_alert(detail):
                         f"{ERROR_ALERT_COOLDOWN_MIN} мин)")
 
 
-def broadcast_drop(text):
+def buy_keyboard(market_name):
+    """Одна URL-кнопка «Купить» — тап открывает предмет на сайте (без чтения текста)."""
+    return {"inline_keyboard": [[
+        {"text": "🛒 Купить", "url": item_link(market_name)},
+    ]]}
+
+
+def broadcast_drop(text, reply_markup=None):
     """Шлёт алерт всем из белого списка, у кого notify=true."""
     recips = notify_recipients()
     sent = 0
     for cid in recips:
-        if tg_send(cid, text, reply_markup=None):
+        if tg_send(cid, text, reply_markup=reply_markup):
             sent += 1
         time.sleep(0.2)   # бережём лимит Telegram
     log(f"📤 алерт разослан: {sent}/{len(recips)} получателей")
@@ -362,16 +373,16 @@ def format_price(p):
 
 
 def build_alert(display_name, items, new_items):
-    """Текст дроп-алерта по требованиям ТЗ."""
-    market_name = next((i["name"] for i in items if i.get("name")), display_name)
+    """Короткий дроп-алерт: имя, count, цена, (tradableAfter если есть).
+    Ссылка вынесена в кнопку «Купить» — чтобы покупать в один тап."""
     count = len(items)
     prices = [i["price"] for i in items if i.get("price") is not None]
-    price_line = ""
+    price_str = ""
     if prices:
         try:
-            price_line = f"\n💰 от {format_price(min(prices, key=float))}"
+            price_str = " · 💰 от " + format_price(min(prices, key=float))
         except (TypeError, ValueError):
-            price_line = f"\n💰 {format_price(prices[0])}"
+            price_str = " · 💰 " + format_price(prices[0])
 
     # tradableAfter — только если есть в данных у новых предметов.
     ta = next((i["tradableAfter"] for i in new_items
@@ -379,9 +390,7 @@ def build_alert(display_name, items, new_items):
     ta_line = f"\n🔒 tradableAfter: {ta}" if ta else ""
 
     return (f"🔥 ДРОП! {display_name}\n"
-            f"📦 в наличии: {count} (новых: {len(new_items)})"
-            f"{price_line}{ta_line}\n"
-            f"{item_link(market_name)}")
+            f"📦 {count} шт (новых: {len(new_items)}){price_str}{ta_line}")
 
 
 # --------------------- Обработка одного предмета ----------------
@@ -431,11 +440,12 @@ def poll_one(mhn, code, st):
 
     if new_ids and not is_control:
         new_items = [i for i in items if i["id"] in new_ids]
+        market_name = rn or mhn
         msg = build_alert(mhn, items, new_items)
         log(f"[{mhn}] 🔥 ДРОП: новых {len(new_ids)}, всего {count}")
         log_event("drop", mhn=mhn, count=count, new_count=len(new_ids),
                   asset_ids=sorted(new_ids))
-        broadcast_drop(msg)
+        broadcast_drop(msg, reply_markup=buy_keyboard(market_name))
 
     if not cur_ids and prev_ids and not is_control:
         log(f"[{mhn}] закончился (был {len(prev_ids)}).")
@@ -491,18 +501,36 @@ def poller_loop():
     if ADMIN_CHAT:
         tg_send(ADMIN_CHAT, "🟢 Бот запущен. Мониторинг идёт постоянно.\nСлежу за:\n• "
                 + "\n• ".join(m for m in TARGETS if m not in CONTROL_ITEMS))
+    real_targets = [(m, c) for m, c in TARGETS.items() if m not in CONTROL_ITEMS]
+    control_targets = [(m, c) for m, c in TARGETS.items() if m in CONTROL_ITEMS]
+
+    def poll_target(mhn, code):
+        if states[mhn]["backoff"] > 0:
+            time.sleep(states[mhn]["backoff"])
+        try:
+            poll_one(mhn, code, states[mhn])
+        except Exception as e:
+            log(f"[{mhn}] непойманная ошибка в poll_one: {e}")
+        time.sleep(random.uniform(ITEM_GAP_MIN, ITEM_GAP_MAX))
+
     last_hb = now()
+    last_control = now()   # контроль только что опрошен в initial_scan
+    idx = 0
 
     while True:
-        for mhn, code in TARGETS.items():
-            if states[mhn]["backoff"] > 0:
-                time.sleep(states[mhn]["backoff"])
-            try:
-                poll_one(mhn, code, states[mhn])
-            except Exception as e:
-                log(f"[{mhn}] непойманная ошибка в poll_one: {e}")
-            time.sleep(random.uniform(ITEM_GAP_MIN, ITEM_GAP_MAX))
+        # 1. Боевые предметы — round-robin, по одному за проход (быстрый детект).
+        if real_targets:
+            mhn, code = real_targets[idx % len(real_targets)]
+            idx += 1
+            poll_target(mhn, code)
 
+        # 2. Контрольный Prisma — редко, только как индикатор «бот видит сток».
+        if control_targets and (now() - last_control).total_seconds() >= CONTROL_EVERY_SEC:
+            for mhn, code in control_targets:
+                poll_target(mhn, code)
+            last_control = now()
+
+        # 3. Heartbeat админу.
         if HEARTBEAT_HOURS > 0 and ADMIN_CHAT:
             if (now() - last_hb).total_seconds() / 3600 >= HEARTBEAT_HOURS:
                 with _counts_lock:
@@ -512,8 +540,6 @@ def poller_loop():
                 tg_send(ADMIN_CHAT, "❤️ Бот жив. В наличии — " + summary)
                 log_event("heartbeat")
                 last_hb = now()
-
-        time.sleep(random.uniform(POLL_MIN, POLL_MAX))
 
 
 # ----------------------- Поток Telegram ------------------------
@@ -730,17 +756,24 @@ def _selftest():
     assert "Prisma Case" in CONTROL_ITEMS
     print("  [ok] Prisma — контрольный (без дроп-алертов)")
 
-    # 5. build_alert: tradableAfter только если есть.
+    # 5. build_alert: tradableAfter только если есть; цена в тексте.
     items_ta = [{"id": "A2", "price": 7.5, "tradableAfter": "2026-07-01",
                  "name": "Fracture Case"}]
     a = build_alert("Fracture Case", items_ta, items_ta)
     assert "tradableAfter" in a and "2026-07-01" in a
+    assert "7.5" in a, "цена не попала в алерт"
     items_no = [{"id": "A3", "price": 7.5, "tradableAfter": None,
                  "name": "Fracture Case"}]
     b = build_alert("Fracture Case", items_no, items_no)
     assert "tradableAfter" not in b, "tradableAfter не должен упоминаться"
-    assert "exchanger?mhn=" in b
-    print("  [ok] build_alert: tradableAfter условно, ссылка есть")
+    print("  [ok] build_alert: tradableAfter условно, цена есть")
+
+    # 5b. Ссылка на покупку — теперь в URL-кнопке.
+    kb = buy_keyboard("Fracture Case")
+    btn = kb["inline_keyboard"][0][0]
+    assert btn["text"] == "🛒 Купить"
+    assert btn["url"].startswith("https://pirateswap.com/exchanger?mhn=")
+    print("  [ok] кнопка «Купить»: URL на предмет")
 
     # 6. notify-флаги: чужой chat_id не добавляется.
     global notify_state
