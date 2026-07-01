@@ -96,6 +96,24 @@ HTTP_PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = os.environ.get("PIRATE_STATE_FILE", "notify_state.json")
 LOG_FILE = os.environ.get("PIRATE_LOG_FILE", "events.jsonl")
 
+# ---------------------- АВТОПОКУПКА ----------------------------
+# Бот сам оформляет покупку в момент детекта (POST /Exchange/start/v2/{steamid}).
+# ⚠️ Тратит реальные деньги и почти наверняка против ToS PirateSwap (риск бана).
+# Всё выключено по умолчанию. Порядок обкатки:
+#   1) AUTOBUY_ENABLED=1 (остальное по умолчанию) -> DRY-RUN: только логирует
+#      «купил бы X за Y», НИЧЕГО не тратит. Убеждаешься, что логика верна.
+#   2) Задаёшь AUTOBUY_MAX_PRICE и, когда готов, AUTOBUY_DRY_RUN=0 -> боевой режим.
+# Kill switch: AUTOBUY_ENABLED=0 мгновенно выключает покупки (мониторинг живёт).
+AUTOBUY_ENABLED = os.environ.get("AUTOBUY_ENABLED", "0") == "1"
+AUTOBUY_DRY_RUN = os.environ.get("AUTOBUY_DRY_RUN", "1") != "0"     # по умолч. симуляция
+AUTOBUY_MAX_PRICE = float(os.environ.get("AUTOBUY_MAX_PRICE", "0") or 0)  # потолок цены; 0 = ничего не купит
+AUTOBUY_DAILY_LIMIT = int(os.environ.get("AUTOBUY_DAILY_LIMIT", "20") or 20)  # макс покупок в сутки
+AUTOBUY_PRICE_FIELD = os.environ.get("AUTOBUY_PRICE_FIELD", "price")   # какое поле цены слать: price | storePrice
+PIRATE_BEARER = os.environ.get("PIRATE_BEARER", "").strip()           # Bearer-токен сайта (протухает!)
+PIRATE_STEAMID = os.environ.get("PIRATE_STEAMID", "").strip()         # твой SteamID64 (публичный)
+
+EXCHANGE_START_URL = "https://web.pirateswap.com/Exchange/start/v2/"
+
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -351,12 +369,14 @@ def fetch(name, code):
             if ihash is not None and int(ihash) != allowed:
                 foreign += 1
                 continue
-        aid = it.get("assetId", it.get("id"))
+        aid = it.get("assetId")
         if aid is None:
             continue
         out.append({
-            "id": str(aid),
+            "assetId": str(aid),          # числовой id единицы — для дедупа/детекта
+            "itemId": it.get("id"),       # GUID — нужен для покупки (start/v2)
             "price": it.get("price"),
+            "storePrice": it.get("storePrice"),
             "tradableAfter": it.get("tradableAfter"),
             "name": it.get("marketHashName"),
         })
@@ -393,6 +413,129 @@ def build_alert(display_name, items, new_items):
             f"📦 {count} шт (новых: {len(new_items)}){price_str}{ta_line}")
 
 
+# --------------------------- Автопокупка -----------------------
+
+_buy_lock = threading.Lock()
+_buy_day = None                  # дата, к которой относится счётчик
+_buy_count = 0                   # сколько куплено за текущие сутки
+
+
+def build_purchase_body(item):
+    """Тело POST /Exchange/start/v2 — покупка одного предмета по его itemId (GUID)."""
+    price = item.get(AUTOBUY_PRICE_FIELD)
+    return {
+        "botInventoryItems": [
+            {"itemId": item["itemId"], "itemSource": 0, "price": price}
+        ],
+        "userInventoryItems": [],
+        "userChestItems": [],
+        "balanceValue": price,
+        "bonusAmount": None,
+    }
+
+
+def purchase(item):
+    """Оформляет покупку. Возвращает (kind, detail):
+    kind = ok | auth | fail | error. detail — exchangeId или текст ошибки."""
+    body = json.dumps(build_purchase_body(item)).encode()
+    url = EXCHANGE_START_URL + PIRATE_STEAMID
+    headers = {
+        "Authorization": "Bearer " + PIRATE_BEARER,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://pirateswap.com",
+        "Referer": "https://pirateswap.com/",
+        "User-Agent": HEADERS["User-Agent"],
+        "x-session-opened-at": str(int(time.time() * 1000)),
+    }
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read().decode("utf-8", errors="replace"))
+        exch = resp.get("exchangeId")
+        return ("ok", exch) if exch else ("fail", resp)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        if e.code == 401:
+            return ("auth", detail)
+        return ("fail", f"HTTP {e.code}: {detail}")
+    except Exception as e:
+        return ("error", str(e))
+
+
+def _daily_ok():
+    """True, если дневной лимит покупок ещё не исчерпан (со сбросом по дате)."""
+    global _buy_day, _buy_count
+    today = now().date()
+    with _buy_lock:
+        if _buy_day != today:
+            _buy_day, _buy_count = today, 0
+        return _buy_count < AUTOBUY_DAILY_LIMIT
+
+
+def _daily_inc():
+    global _buy_count
+    with _buy_lock:
+        _buy_count += 1
+
+
+def try_autobuy(mhn, new_items):
+    """Пытается купить самый дешёвый из новых предметов в пределах потолка.
+    Возвращает строку-результат для алерта, либо None (автопокупка выключена)."""
+    if not AUTOBUY_ENABLED:
+        return None
+
+    cands = [i for i in new_items
+             if i.get("itemId") and i.get(AUTOBUY_PRICE_FIELD) is not None]
+    cands.sort(key=lambda i: float(i[AUTOBUY_PRICE_FIELD]))
+    if not cands:
+        return None
+
+    cand = next((i for i in cands
+                 if float(i[AUTOBUY_PRICE_FIELD]) <= AUTOBUY_MAX_PRICE), None)
+    if cand is None:
+        cheapest = cands[0][AUTOBUY_PRICE_FIELD]
+        log(f"[{mhn}] autobuy: пропуск, цена {cheapest} > потолка {AUTOBUY_MAX_PRICE}")
+        return f"🛑 автопокупка: цена {cheapest} выше потолка {AUTOBUY_MAX_PRICE}"
+
+    price = cand[AUTOBUY_PRICE_FIELD]
+
+    if not _daily_ok():
+        log(f"[{mhn}] autobuy: дневной лимит {AUTOBUY_DAILY_LIMIT} исчерпан")
+        return f"🛑 автопокупка: дневной лимит {AUTOBUY_DAILY_LIMIT} исчерпан"
+
+    if AUTOBUY_DRY_RUN:
+        log(f"[{mhn}] autobuy DRY-RUN: купил бы {cand.get('name')} "
+            f"(itemId={cand['itemId']}) за {price}")
+        log_event("autobuy_dryrun", mhn=mhn, price=price, itemId=cand["itemId"])
+        return f"🧪 dry-run: купил бы {mhn} за {price}"
+
+    if not (PIRATE_BEARER and PIRATE_STEAMID):
+        log(f"[{mhn}] autobuy: нет PIRATE_BEARER/PIRATE_STEAMID — не покупаю")
+        return "🛑 автопокупка: не задан токен/SteamID"
+
+    kind, detail = purchase(cand)
+    if kind == "ok":
+        _daily_inc()
+        log(f"[{mhn}] ✅ куплено за {price} (exchangeId={detail})")
+        log_event("autobuy_ok", mhn=mhn, price=price, exchangeId=str(detail))
+        return f"✅ Куплено: {mhn} за {price}"
+    if kind == "auth":
+        log(f"[{mhn}] 🔑 autobuy 401 — токен протух")
+        if ADMIN_CHAT:
+            tg_send(ADMIN_CHAT, "🔑 Токен автопокупки протух (401). "
+                                "Обнови PIRATE_BEARER на Render.")
+        log_event("autobuy_auth", mhn=mhn)
+        return "🔑 не куплено: токен протух"
+    log(f"[{mhn}] ⚠️ autobuy не удалось: {detail}")
+    log_event("autobuy_fail", mhn=mhn, detail=str(detail)[:200])
+    return f"⚠️ не купил ({mhn}): {str(detail)[:80]}"
+
+
 # --------------------- Обработка одного предмета ----------------
 
 def poll_one(mhn, code, st):
@@ -426,7 +569,7 @@ def poll_one(mhn, code, st):
         log(f"[{mhn}] ⚠️ отброшено чужих предметов: {foreign} (алерт по ним НЕ шлю)")
         log_event("mismatch", mhn=mhn, count=foreign)
 
-    cur_ids = {i["id"] for i in items}
+    cur_ids = {i["assetId"] for i in items}
     count = len(cur_ids)
     is_control = mhn in CONTROL_ITEMS
 
@@ -439,12 +582,16 @@ def poll_one(mhn, code, st):
     new_ids = cur_ids - prev_ids
 
     if new_ids and not is_control:
-        new_items = [i for i in items if i["id"] in new_ids]
+        new_items = [i for i in items if i["assetId"] in new_ids]
         market_name = rn or mhn
-        msg = build_alert(mhn, items, new_items)
         log(f"[{mhn}] 🔥 ДРОП: новых {len(new_ids)}, всего {count}")
         log_event("drop", mhn=mhn, count=count, new_count=len(new_ids),
                   asset_ids=sorted(new_ids))
+        # Автопокупка — ПЕРВЫМ делом (миллисекунды решают), потом уже алерт.
+        buy_result = try_autobuy(mhn, new_items)
+        msg = build_alert(mhn, items, new_items)
+        if buy_result:
+            msg += "\n" + buy_result
         broadcast_drop(msg, reply_markup=buy_keyboard(market_name))
 
     if not cur_ids and prev_ids and not is_control:
@@ -474,7 +621,7 @@ def initial_scan(states):
     for mhn, code in TARGETS.items():
         try:
             items, foreign = fetch(mhn, code)
-            ids = {i["id"] for i in items}
+            ids = {i["assetId"] for i in items}
             states[mhn]["prev_ids"] = ids
             rn = next((i["name"] for i in items if i.get("name")), None)
             if rn:
@@ -498,6 +645,14 @@ def poller_loop():
     states = make_states()
     initial_scan(states)
     log_event("startup")
+    if not AUTOBUY_ENABLED:
+        log("Автопокупка: ВЫКЛ (только алерты).")
+    else:
+        mode = "DRY-RUN (симуляция)" if AUTOBUY_DRY_RUN else "БОЕВОЙ (тратит деньги!)"
+        log(f"Автопокупка: ВКЛ [{mode}] price_field={AUTOBUY_PRICE_FIELD} "
+            f"max_price={AUTOBUY_MAX_PRICE} daily_limit={AUTOBUY_DAILY_LIMIT} "
+            f"token={'есть' if PIRATE_BEARER else 'НЕТ'} "
+            f"steamid={'есть' if PIRATE_STEAMID else 'НЕТ'}")
     if ADMIN_CHAT:
         tg_send(ADMIN_CHAT, "🟢 Бот запущен. Мониторинг идёт постоянно.\nСлежу за:\n• "
                 + "\n• ".join(m for m in TARGETS if m not in CONTROL_ITEMS))
@@ -742,7 +897,7 @@ def _selftest():
     finally:
         urllib.request.urlopen = orig
     assert foreign == 1, f"чужой не отброшен (foreign={foreign})"
-    assert {i['id'] for i in items} == {"A1"}, "остались не те id"
+    assert {i['assetId'] for i in items} == {"A1"}, "остались не те id"
     print("  [ok] анти-ложная защита: чужой hash отброшен")
 
     # 3. Детект дропа по разнице множеств.
@@ -774,6 +929,31 @@ def _selftest():
     assert btn["text"] == "🛒 Купить"
     assert btn["url"].startswith("https://pirateswap.com/exchanger?mhn=")
     print("  [ok] кнопка «Купить»: URL на предмет")
+
+    # 5c. Тело покупки: itemId (GUID), цена, balanceValue.
+    item = {"assetId": "A2", "itemId": "guid-123", "price": 0.43,
+            "storePrice": 0.40, "name": "Recoil Case"}
+    body = build_purchase_body(item)
+    assert body["botInventoryItems"][0]["itemId"] == "guid-123"
+    assert body["botInventoryItems"][0]["itemSource"] == 0
+    assert body["balanceValue"] == body["botInventoryItems"][0]["price"]
+    print("  [ok] build_purchase_body: itemId + цена + balanceValue")
+
+    # 5d. try_autobuy DRY-RUN: не тратит, уважает потолок цены.
+    global AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE
+    _sv = (AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE)
+    try:
+        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE = True, True, 1.0
+        r = try_autobuy("Recoil Case", [item])
+        assert r and "dry-run" in r, f"dry-run не сработал: {r}"
+        AUTOBUY_MAX_PRICE = 0.1                     # ниже цены 0.43 -> не купит
+        r2 = try_autobuy("Recoil Case", [item])
+        assert r2 and "потолка" in r2, f"потолок не сработал: {r2}"
+        AUTOBUY_ENABLED = False                     # выключено -> None
+        assert try_autobuy("Recoil Case", [item]) is None
+    finally:
+        AUTOBUY_ENABLED, AUTOBUY_DRY_RUN, AUTOBUY_MAX_PRICE = _sv
+    print("  [ok] автопокупка: dry-run, потолок цены, kill-switch")
 
     # 6. notify-флаги: чужой chat_id не добавляется.
     global notify_state
